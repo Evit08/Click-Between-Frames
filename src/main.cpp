@@ -379,12 +379,47 @@ class $modify(GJBaseGameLayer) {
 CCPoint p1Pos = { 0.f, 0.f };
 CCPoint p2Pos = { 0.f, 0.f };
 
+// Tracks "airborne because a blue (gravity) orb was clicked" per player,
+// specifically for the dual-mode copter scenario (p1 clicks orbs to flip
+// p2's gravity while controlling a shared cube/ball). There's no direct
+// orb-collision hook in this file, so this is inferred instead: a portal
+// can flip m_isUpsideDown with no click involved, but an orb requires one -
+// so "gravity flipped on the same tick this player had an input" is a
+// strong (if not airtight) signal specifically for an orb click. Reset the
+// moment the player is grounded again, since that's when copter's
+// "release doesn't matter" special case should stop applying.
+bool p1WasUpsideDown = false;
+bool p2WasUpsideDown = false;
+bool p1OrbFlipped = false;
+bool p2OrbFlipped = false;
+
 float rotationDelta;
 float shipRotDelta = 0.0f;
 bool inputThisStep = false;
 bool p1Split = false;
 bool p2Split = false;
 bool midStep = false;
+int p2SubstepCount = 0;
+
+// Proactively checks whether a player is currently overlapping a blue
+// (gravity) orb, object ID 84, by scanning m_touchingRings directly.
+// Unlike p1OrbFlipped/p2OrbFlipped (which compares m_isUpsideDown before
+// vs. after and can therefore only ever notice a flip one tick after it
+// already happened), this reflects the orb touch on the exact tick it's
+// detected, since collision/touch detection happens before the flip is
+// applied within the same step. In Dual Mode, either side touching the
+// orb flips both players' gravity simultaneously (the other side never
+// appears in its own m_touchingRings at all), so both this and p2 need
+// to be checked regardless of which one is being evaluated.
+bool isTouchingBlueOrb(PlayerObject* p) {
+	if (!p || !p->m_touchingRings) return false;
+	CCArray* rings = p->m_touchingRings;
+	for (unsigned int i = 0; i < rings->count(); i++) {
+		auto obj = static_cast<GameObject*>(rings->objectAtIndex(i));
+		if (obj && obj->m_objectID == 84) return true;
+	}
+	return false;
+}
 
 class $modify(PlayerObject) {
 	// split a single step based on the entries in stepQueue
@@ -416,25 +451,47 @@ class $modify(PlayerObject) {
 		bool p1StartedOnGround = this->m_isOnGround;
 		bool p2StartedOnGround = p2->m_isOnGround;
 
+		// See p1OrbFlipped/p2OrbFlipped declaration above. Reset on landing
+		// (no longer "airborne from an orb"); otherwise, flag it the tick
+		// gravity actually flips while airborne with an input present.
+		// Kept as a fallback alongside the proactive touch-check below, in
+		// case a very fast pass-through clears m_touchingRings before this
+		// function reads it in the same step.
+		if (p1StartedOnGround) p1OrbFlipped = false;
+		else if (this->m_isUpsideDown != p1WasUpsideDown) p1OrbFlipped = true;
+		p1WasUpsideDown = this->m_isUpsideDown;
+
+		if (p2StartedOnGround) p2OrbFlipped = false;
+		else if (p2->m_isUpsideDown != p2WasUpsideDown) p2OrbFlipped = true;
+		p2WasUpsideDown = p2->m_isUpsideDown;
+
+		// Either player touching the orb flips gravity for both in Dual
+		// Mode, so this single flag feeds into both NotBuffering checks
+		// below rather than being split per-player.
+		bool eitherTouchingBlueOrb = isTouchingBlueOrb(this) || isTouchingBlueOrb(p2);
+
 		bool p1NotBuffering = p1StartedOnGround
-			|| this->m_touchingRings->count()
-			|| this->m_isDashing
-			|| (this->m_isDart || this->m_isBird || this->m_isShip || this->m_isSwing);
+		|| this->m_touchingRings->count()
+		|| this->m_isDashing
+		|| this->m_isDart || this->m_isBird || this->m_isShip || this->m_isSwing || this->m_isRobot
+		|| (isDual && (eitherTouchingBlueOrb || p1OrbFlipped));
 
 		bool p2NotBuffering = p2StartedOnGround
-			|| p2->m_touchingRings->count()
-			|| p2->m_isDashing
-			|| (p2->m_isDart || p2->m_isBird || p2->m_isShip || p2->m_isSwing);
+		|| p2->m_touchingRings->count()
+		|| p2->m_isDashing
+		|| p2->m_isDart || p2->m_isBird || p2->m_isShip || p2->m_isSwing || p2->m_isRobot
+		|| (isDual && (eitherTouchingBlueOrb || p2OrbFlipped));
 
 		p1Pos = PlayerObject::getPosition(); // save for later to prevent desync with move triggers & some other issues
 		p2Pos = p2->getPosition();
 
 		p1Split = p1NotBuffering;
 		p2Split = p2NotBuffering && isDual;
-		
+
 		Step step;
 		bool firstLoop = true;
 		midStep = true;
+		p2SubstepCount = 0;
 
 		do {
 			step = popStepQueue();
@@ -455,6 +512,7 @@ class $modify(PlayerObject) {
 
 			if (p2Split) {
 				p2->update(substepDelta);
+				p2SubstepCount++;
 				if (!step.endStep) {
 					if (firstLoop && ((p2->m_yVelocity < 0) ^ p2->m_isUpsideDown)) p2->m_isOnGround = p2StartedOnGround;
 					if (!p2->m_isOnSlope || p2->m_isDart) pl->checkCollisions(p2, 0.0f, true);
@@ -463,7 +521,7 @@ class $modify(PlayerObject) {
 					decomp_resetCollisionLog(p2);
 				}
 			}
-			else if (step.endStep) p2->update(stepDelta);
+			else if (step.endStep) { p2->update(stepDelta); p2SubstepCount++; }
 
 			firstLoop = false;
 		} while (!step.endStep);
